@@ -1,11 +1,13 @@
 import type {
   Bundle,
   Coding,
+  FhirResource,
   ParametersParameter,
   Questionnaire,
   QuestionnaireItem,
   QuestionnaireResponse,
   QuestionnaireResponseItem,
+  Resource,
   ValueSet,
 } from "fhir/r4";
 
@@ -76,20 +78,40 @@ export function inlineBundleValueSets(
   questionnaire: Questionnaire,
   bundle: Bundle,
 ): Questionnaire {
+  const bundleValueSets = (bundle.entry ?? [])
+    .map((entry) => entry.resource)
+    .filter((resource) => resource?.resourceType === "ValueSet") as ValueSet[];
+  return inlineValueSets(
+    questionnaire,
+    bundleValueSets,
+    questionnaire.contained ?? [],
+  );
+}
+
+/**
+ * Inlines answer options from expanded ValueSets. `shared` ValueSets match an
+ * answerValueSet canonical by url. `local` resources are contained alongside
+ * the Questionnaire: in Questionnaire.contained, or as siblings of a contained
+ * Questionnaire in an adaptive QuestionnaireResponse. They match by "#<id>"
+ * and also by url, since payers use either form to reference them.
+ */
+export function inlineValueSets(
+  questionnaire: Questionnaire,
+  shared: ValueSet[],
+  local: Resource[],
+): Questionnaire {
   const valueSets = new Map<string, ValueSet>();
   const register = (vs: ValueSet, key: string | undefined) => {
     if (key && vs.expansion?.contains?.length) valueSets.set(key, vs);
   };
-  for (const entry of bundle.entry ?? []) {
-    const resource = entry.resource;
-    if (resource?.resourceType === "ValueSet") {
-      register(resource as ValueSet, (resource as ValueSet).url);
-    }
+  for (const vs of shared) {
+    register(vs, vs.url);
   }
-  // Contained ValueSets are referenced as "#<id>" from answerValueSet.
-  for (const contained of questionnaire.contained ?? []) {
-    if (contained.resourceType === "ValueSet") {
-      register(contained as ValueSet, `#${contained.id}`);
+  for (const resource of local) {
+    if (resource.resourceType === "ValueSet") {
+      const vs = resource as ValueSet;
+      register(vs, vs.id ? `#${vs.id}` : undefined);
+      register(vs, vs.url);
     }
   }
   if (valueSets.size === 0) return questionnaire;
@@ -206,4 +228,35 @@ export function alignChoiceAnswers(
   };
   walk(result.item);
   return result;
+}
+
+const POPULATE_SUPPORT_TYPES = new Set(["Library", "ValueSet", "CodeSystem"]);
+
+/**
+ * Returns a copy of a package bundle with additional Libraries, ValueSets and
+ * CodeSystems appended. The adaptive loop uses it to populate a Questionnaire
+ * revision from $next-question, whose CQL may live in Libraries the payer only
+ * ships contained in that response rather than in the original package.
+ * An added resource replaces a bundle entry of the same type with the same
+ * url, or with the same id when either lacks a url.
+ */
+export function withPackageResources(
+  bundle: Bundle,
+  resources: Resource[],
+): Bundle {
+  const entries = [...(bundle.entry ?? [])];
+  for (const resource of resources) {
+    if (!POPULATE_SUPPORT_TYPES.has(resource.resourceType)) continue;
+    const url = (resource as { url?: string }).url;
+    const idx = entries.findIndex((e) => {
+      const r = e.resource;
+      if (r?.resourceType !== resource.resourceType) return false;
+      const rUrl = (r as { url?: string }).url;
+      return url && rUrl ? rUrl === url : Boolean(r.id) && r.id === resource.id;
+    });
+    const entry = { resource: resource as FhirResource };
+    if (idx >= 0) entries[idx] = entry;
+    else entries.push(entry);
+  }
+  return { ...bundle, entry: entries };
 }

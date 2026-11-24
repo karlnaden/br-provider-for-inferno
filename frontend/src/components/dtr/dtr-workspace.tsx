@@ -4,6 +4,7 @@ import type {
   Bundle,
   Coverage,
   DomainResource,
+  FhirResource,
   Questionnaire,
   QuestionnaireResponse,
 } from "fhir/r4";
@@ -34,6 +35,7 @@ import {
 } from "@/hooks/use-patient-qr-index";
 import { usePayerServer } from "@/hooks/use-payer-server";
 import {
+  postProviderPopulate,
   type QuestionnairePackageEntry,
   useProviderPopulate,
   useQuestionnairePackageEntries,
@@ -43,7 +45,11 @@ import {
 import { parseCoverageInfoFromResource } from "@/lib/coverage-extensions";
 import { propagateCoverageInfo } from "@/lib/coverage-propagation";
 import { broadcastDtrCompletion } from "@/lib/dtr-completion";
-import { alignChoiceAnswers, coerceDateAnswers } from "@/lib/dtr-ingestion";
+import {
+  alignChoiceAnswers,
+  coerceDateAnswers,
+  withPackageResources,
+} from "@/lib/dtr-ingestion";
 import {
   copyMissingExtensionsWithContained,
   type IntendedUse,
@@ -56,11 +62,15 @@ import {
   buildOriginIndex,
   stampOrigins,
 } from "@/lib/information-origin";
+import {
+  ADAPTIVE_EXT_URL,
+  type PackageResumeHint,
+  resolveResumeHints,
+  setPackageRetrievedAt,
+} from "@/lib/package-retrieval";
+import { qrCanonical, stripCanonicalVersion } from "@/lib/qr-canonical";
 import { isTerminalQrStatus, type TerminalQrStatus } from "@/lib/qr-status";
 import { cn } from "@/lib/utils";
-
-const ADAPTIVE_EXT_URL =
-  "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-questionnaireAdaptive";
 
 export interface DtrTaskContext {
   iss: string;
@@ -195,19 +205,53 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
   );
   const existingQrId = existingQrRef?.split("/")[1];
 
-  const { data: existingQr } = useQuery({
+  const existingQrEnabled = !!existingQrId && !!providerFhirUrl;
+  const existingQrQuery = useQuery({
     queryKey: ["fhir", "QuestionnaireResponse", existingQrId],
     queryFn: () =>
       fhirFetch<QuestionnaireResponse>(
         `${providerFhirUrl}/QuestionnaireResponse/${existingQrId}`,
       ),
-    enabled: !!existingQrId && !!providerFhirUrl,
+    enabled: existingQrEnabled,
   });
+  const existingQr = existingQrQuery.data;
 
   const inProgressQrsQuery = usePatientQuestionnaireResponses(
     context.patientId ?? "",
     "in-progress",
   );
+
+  // Resume hint (changedsince, plus an adaptive draft's own package) per
+  // requested canonical, from the in-progress QR that will be resumed. Latched once the QR lookups settle: a later save refetches
+  // the QR list, and a changed query key would refetch the package and reset
+  // the open form. Launches that name no canonical skip it, since the
+  // payer's package set is not known until the response arrives.
+  const [resumeByCanonical, setResumeByCanonical] = useState<Record<
+    string,
+    PackageResumeHint
+  > | null>(null);
+  const resumeLookupSettled =
+    (!existingQrEnabled || existingQrQuery.isFetched) &&
+    (!selectedProviderFhirUrl ||
+      !context.patientId ||
+      inProgressQrsQuery.isFetched);
+  useEffect(() => {
+    if (resumeByCanonical || !resumeLookupSettled) return;
+    const inProgress = (inProgressQrsQuery.data?.entry ?? [])
+      .map((e) => e.resource)
+      .filter((r): r is QuestionnaireResponse => isQuestionnaireResponse(r));
+    setResumeByCanonical(
+      resolveResumeHints(questionnaireCanonicals, inProgress, existingQr),
+    );
+  }, [
+    resumeByCanonical,
+    resumeLookupSettled,
+    inProgressQrsQuery.data,
+    questionnaireCanonicals,
+    existingQr,
+  ]);
+  const packagesReady =
+    questionnaireCanonicals.length === 0 || resumeByCanonical !== null;
 
   // Patient-wide QR index for order-anchored satisfaction state. Drives tab
   // decoration and the read-only display fallback in activeExistingQr when a
@@ -227,6 +271,8 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
     coverageRef: resolvedCoverageRef,
     orderRef,
     coverageAssertionId: context.coverageAssertionId,
+    resumeByCanonical: resumeByCanonical ?? undefined,
+    enabled: packagesReady,
   });
 
   // Single-fetch path: used when the launch does not already know a set of
@@ -241,7 +287,10 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
     orderRef,
     coverageAssertionId: context.coverageAssertionId,
     questionnaire: questionnaireCanonicals,
-    enabled: !isKnownMultiCanonical,
+    ...(questionnaireCanonicals.length === 1
+      ? resumeByCanonical?.[questionnaireCanonicals[0]]
+      : undefined),
+    enabled: !isKnownMultiCanonical && packagesReady,
   });
 
   const packageEntries = isKnownMultiCanonical
@@ -265,7 +314,7 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
     for (const entry of inProgressQrsQuery.data?.entry ?? []) {
       const qr = entry.resource;
       if (!isQuestionnaireResponse(qr)) continue;
-      const c = qr.questionnaire;
+      const c = qrCanonical(qr);
       if (!c) continue;
       const stripped = stripCanonicalVersion(c);
       for (const target of effectiveCanonicals) {
@@ -335,19 +384,45 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
     providerFhirUrl,
   });
 
+  // Adaptive rounds populate each Questionnaire revision $next-question
+  // returns, with the same subject and package as the launch-time populate.
+  // Launch contexts are rebuilt from the revision, which may declare more.
+  const activeBundle = activePackage?.bundle;
+  const populateAdaptive = useCallback(
+    async (
+      questionnaire: Questionnaire,
+      resources: FhirResource[],
+    ): Promise<QuestionnaireResponse | null> => {
+      if (!patientRef || !activeBundle) return null;
+      const result = await postProviderPopulate({
+        questionnaire,
+        packageBundle: withPackageResources(activeBundle, resources),
+        subject: patientRef,
+        contexts: buildLaunchContexts(
+          questionnaire,
+          patientRef,
+          orderRef,
+          encounterRef,
+        ),
+        providerFhirUrl,
+      });
+      return result.response;
+    },
+    [activeBundle, patientRef, orderRef, encounterRef, providerFhirUrl],
+  );
+
   const activeCanonical =
     packageEntries[safeActiveIndex]?.canonical ||
     effectiveCanonicals[0] ||
     null;
 
   const activeExistingQr = useMemo(() => {
-    if (existingQr?.questionnaire && activeCanonical) {
-      const fhirContextStripped = stripCanonicalVersion(
-        existingQr.questionnaire,
-      );
+    const existingCanonical = existingQr ? qrCanonical(existingQr) : undefined;
+    if (existingQr && existingCanonical && activeCanonical) {
+      const fhirContextStripped = stripCanonicalVersion(existingCanonical);
       const activeStripped = stripCanonicalVersion(activeCanonical);
       if (
-        existingQr.questionnaire === activeCanonical ||
+        existingCanonical === activeCanonical ||
         fhirContextStripped === activeStripped
       ) {
         return existingQr;
@@ -559,6 +634,12 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
         intendedUse,
       });
 
+      // Record this package's retrieval time so a resume can ask the payer
+      // what changed since (changedsince); see package-retrieval.ts.
+      if (activeEntry?.retrievedAt) {
+        setPackageRetrievedAt(response, activeEntry.retrievedAt);
+      }
+
       const sourceQr = activeExistingQr ?? mergedQr;
       if (sourceQr?.extension) {
         copyMissingExtensionsWithContained(sourceQr, response);
@@ -609,6 +690,7 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
       coverageResolutionPending,
       intendedUse,
       activeExistingQr,
+      activeEntry?.retrievedAt,
       mergedQr,
       propagateCoverage,
       notifyDtrCompletion,
@@ -847,6 +929,7 @@ export function DtrWorkspace({ context, onClose }: DtrWorkspaceProps) {
               onSave={handleSave}
               isSaving={saveResponse.isPending}
               payerFhirUrl={payerFhirUrl}
+              populate={populateAdaptive}
               readOnly={!isEditing}
               allowInProgressSave={
                 !isTerminalQrStatus(activeExistingQr?.status)
@@ -880,11 +963,6 @@ function isQuestionnaireResponse(
     (resource as { resourceType?: string }).resourceType ===
       "QuestionnaireResponse"
   );
-}
-
-function stripCanonicalVersion(canonical: string): string {
-  const pipeIdx = canonical.indexOf("|");
-  return pipeIdx === -1 ? canonical : canonical.substring(0, pipeIdx);
 }
 
 function friendlyCanonicalName(canonical: string): string {

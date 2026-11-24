@@ -11,7 +11,9 @@ import {
   coerceDateAnswers,
   extractPackageBundles,
   inlineBundleValueSets,
+  inlineValueSets,
   selectPackageBundle,
+  withPackageResources,
 } from "./dtr-ingestion";
 
 describe("extractPackageBundles", () => {
@@ -252,10 +254,66 @@ describe("inlineBundleValueSets", () => {
     expect(result.item?.[0].answerOption?.[0].valueCoding?.code).toBe("male");
   });
 
+  it("inlines a contained ValueSet referenced by its canonical url", () => {
+    const q: Questionnaire = {
+      ...questionnaireWithChoice(GENDER_VS),
+      contained: [{ ...expandedValueSet(GENDER_VS), id: "vs1" }],
+    };
+    const result = inlineBundleValueSets(q, {
+      resourceType: "Bundle",
+      type: "collection",
+    });
+    const item = result.item?.[0].item?.[0];
+    expect(item?.answerValueSet).toBeUndefined();
+    expect(item?.answerOption).toHaveLength(2);
+  });
+
   it("does not mutate the input questionnaire", () => {
     const q = questionnaireWithChoice(GENDER_VS);
     inlineBundleValueSets(q, bundleWith(expandedValueSet(GENDER_VS)));
     expect(q.item?.[0].item?.[0].answerValueSet).toBe(GENDER_VS);
+  });
+});
+
+describe("inlineValueSets", () => {
+  const GENDER_VS = "http://example.org/ValueSet/gender";
+
+  // A ValueSet contained in an adaptive QR as a sibling of the Questionnaire.
+  const sibling: ValueSet = {
+    resourceType: "ValueSet",
+    id: "gender",
+    url: GENDER_VS,
+    status: "active",
+    expansion: {
+      timestamp: "2026-07-01T00:00:00Z",
+      contains: [{ system: "http://example.org", code: "f", display: "F" }],
+    },
+  };
+
+  function choice(answerValueSet: string): Questionnaire {
+    return {
+      resourceType: "Questionnaire",
+      status: "active",
+      item: [{ linkId: "g", type: "choice", answerValueSet }],
+    };
+  }
+
+  it("resolves a sibling ValueSet referenced as #id", () => {
+    const result = inlineValueSets(choice("#gender"), [], [sibling]);
+    expect(result.item?.[0].answerValueSet).toBeUndefined();
+    expect(result.item?.[0].answerOption?.[0].valueCoding?.code).toBe("f");
+  });
+
+  it("resolves a sibling ValueSet referenced by url", () => {
+    const result = inlineValueSets(choice(GENDER_VS), [], [sibling]);
+    expect(result.item?.[0].answerOption?.[0].valueCoding?.code).toBe("f");
+  });
+
+  it("ignores a sibling ValueSet without an expansion", () => {
+    const { expansion: _e, ...unexpanded } = sibling;
+    const result = inlineValueSets(choice("#gender"), [], [unexpanded]);
+    expect(result.item?.[0].answerValueSet).toBe("#gender");
+    expect(result.item?.[0].answerOption).toBeUndefined();
   });
 });
 
@@ -376,5 +434,50 @@ describe("coerceDateAnswers", () => {
       "2020-07-01T10:40:10+01:00",
     );
     expect(qr.item?.[0].answer?.[0].valueDateTime).toBeDefined();
+  });
+});
+
+describe("withPackageResources", () => {
+  const lib = (id: string, url?: string, version?: string) =>
+    ({
+      resourceType: "Library",
+      id,
+      status: "active",
+      type: {},
+      url,
+      version,
+    }) as const;
+
+  it("appends support resources and ignores other types", () => {
+    const bundle: Bundle = {
+      resourceType: "Bundle",
+      type: "collection",
+      entry: [],
+    };
+    const out = withPackageResources(bundle, [
+      lib("a", "http://x/Library/a"),
+      { resourceType: "Patient", id: "p" },
+    ]);
+    expect(out.entry?.map((e) => e.resource?.id)).toEqual(["a"]);
+    expect(bundle.entry).toHaveLength(0);
+  });
+
+  it("replaces an entry with the same url, or the same id without a url", () => {
+    const bundle: Bundle = {
+      resourceType: "Bundle",
+      type: "collection",
+      entry: [
+        { resource: lib("a", "http://x/Library/a", "1") },
+        { resource: lib("b") },
+      ],
+    };
+    const out = withPackageResources(bundle, [
+      lib("other-id", "http://x/Library/a", "2"),
+      lib("b", undefined, "2"),
+    ]);
+    expect(out.entry).toHaveLength(2);
+    expect(
+      out.entry?.map((e) => (e.resource as { version?: string }).version),
+    ).toEqual(["2", "2"]);
   });
 });
